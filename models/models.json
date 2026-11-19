@@ -1,0 +1,9 @@
+[
+  {
+    "file": "segformer_b0_416x320.onnx",
+    "label": "SegFormer-B0 416x320",
+    "height": 416,
+    "width": 320,
+    "mb": 15.2
+  }
+]

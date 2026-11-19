@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>あししるべ 歩行誘導</title>
+<style>
+  :root { --bg:#111; --fg:#eee; --sub:#9a9a9a; --ok:#3cb371; --warn:#e0a020; --ng:#e04848; --btn:#2a2a2a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family: system-ui, "Noto Sans JP", sans-serif; font-size:15px; }
+  header { display:flex; gap:8px; flex-wrap:wrap; padding:8px 10px; font-size:13px; color:var(--sub); }
+  .pill { padding:2px 8px; border-radius:10px; background:#222; }
+  .pill.ok { color:#fff; background:var(--ok); } .pill.ng { color:#fff; background:var(--ng); } .pill.warn { color:#000; background:var(--warn); }
+  #view { position:relative; width:100%; max-width:480px; margin:0 auto; }
+  #canvas { width:100%; display:block; background:#000; image-rendering:auto; }
+  #cmdBig { position:absolute; right:8px; top:8px; width:72px; height:72px; border-radius:12px; background:rgba(0,0,0,.6);
+            font-size:44px; display:flex; align-items:center; justify-content:center; }
+  #stats { font-family: ui-monospace, monospace; font-size:13px; padding:6px 10px; line-height:1.5; white-space:pre; overflow-x:auto; }
+  .row { display:flex; gap:8px; padding:6px 10px; }
+  button { flex:1; min-height:52px; font-size:17px; border:0; border-radius:10px; background:var(--btn); color:var(--fg); }
+  button:disabled { opacity:.4; }
+  button.primary { background:#2d6cdf; } button.danger { background:#a33; } button.hit { background:#6b4b16; font-size:20px; }
+  #threshVal { flex:0 0 72px; display:flex; align-items:center; justify-content:center; font-size:17px; }
+  details { margin:6px 10px; background:#1b1b1b; border-radius:10px; padding:4px 10px; }
+  summary { padding:8px 0; color:var(--sub); }
+  label { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:6px 0; }
+  select, input { font-size:15px; background:#222; color:var(--fg); border:1px solid #444; border-radius:6px; padding:6px; max-width:60%; }
+  #log { font-family: ui-monospace, monospace; font-size:12px; color:var(--sub); padding:6px 10px 40px; white-space:pre-wrap; }
+  #summary { margin:6px 10px; padding:8px; background:#1d2a1d; border-radius:10px; white-space:pre-wrap; font-family: ui-monospace, monospace; font-size:13px; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <span id="pBle" class="pill ng">BLE 未接続</span>
+  <span id="pEp" class="pill">推論 未準備</span>
+  <span id="pRun" class="pill">停止中</span>
+</header>
+
+<div id="view">
+  <canvas id="canvas" width="320" height="416"></canvas>
+  <div id="cmdBig">■</div>
+</div>
+<div id="stats">―</div>
+
+<div class="row">
+  <button id="btnBle">Bluetooth接続</button>
+  <button id="btnStart" class="primary">開始</button>
+  <button id="btnStop" class="danger" disabled>停止</button>
+</div>
+<div class="row">
+  <button id="btnHit" class="hit">衝突 +1</button>
+  <button id="btnUnhit" style="flex:0 0 80px">−1</button>
+</div>
+<div class="row">
+  <button id="btnThMinus" style="flex:0 0 80px">thresh −</button>
+  <div id="threshVal">0.22</div>
+  <button id="btnThPlus" style="flex:0 0 80px">thresh +</button>
+  <button id="btnRot">回転</button>
+</div>
+<div id="summary"></div>
+<div class="row"><button id="btnSave">CSVを保存</button></div>
+
+<details>
+  <summary>設定</summary>
+  <label>モデル <select id="selModel"></select></label>
+  <label>推論の実行先 <select id="selEp"><option value="webgpu">WebGPU（推奨）</option><option value="wasm">WASM（CPU・遅い）</option></select></label>
+  <label>カメラ <select id="selCam"><option value="">背面（既定）</option></select></label>
+  <label>回転 <select id="selRot"><option>auto</option><option>0</option><option>90</option><option>180</option><option>270</option></select></label>
+  <label>床ロスト時の指示 <select id="selLost"><option value="S">S（両側振動＝止まれ）</option><option value="C">C（旧仕様）</option></select></label>
+  <label>L/R切替の最小間隔 [s] <input id="inHold" type="number" step="0.05" min="0"></label>
+  <label>前フレームとの平均の重み <input id="inSmooth" type="number" step="0.05" min="0" max="0.95"></label>
+  <label>床ロスト判定の面積比 <input id="inMinFloor" type="number" step="0.01" min="0"></label>
+  <label>床ロスト判定のフレーム数 <input id="inLostFrames" type="number" step="1" min="1"></label>
+  <label>画面表示（OFFで少し軽くなる） <select id="selDraw"><option value="1">ON</option><option value="0">OFF</option></select></label>
+  <label>試行メモ（CSVのファイル名に入る） <input id="inTag" type="text" placeholder="例: s01_run1"></label>
+  <div class="row"><button id="btnTest">振動テスト（L→R→S→C）</button></div>
+  <div class="row"><button id="btnRestore">前回のバックアップを保存</button></div>
+</details>
+
+<div id="log"></div>
+
+<!-- display:none だとフレーム通知が止まる端末があるので、見えない大きさで表示しておく -->
+<video id="video" playsinline muted style="position:fixed;left:0;bottom:0;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
+<script type="module" src="app.js"></script>
+</body>
+</html>
