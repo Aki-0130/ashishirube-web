@@ -58,7 +58,7 @@
   <button id="btnRot">回転</button>
 </div>
 <div id="summary"></div>
-<div class="row"><button id="btnSave">CSVを保存</button></div>
+<div class="row"><button id="btnSave">CSVを保存</button><button id="btnDiag">診断</button></div>
 
 <details>
   <summary>設定</summary>
@@ -71,7 +71,7 @@
   <label>前フレームとの平均の重み <input id="inSmooth" type="number" step="0.05" min="0" max="0.95"></label>
   <label>床ロスト判定の面積比 <input id="inMinFloor" type="number" step="0.01" min="0"></label>
   <label>床ロスト判定のフレーム数 <input id="inLostFrames" type="number" step="1" min="1"></label>
-  <label>画面表示（OFFで少し軽くなる） <select id="selDraw"><option value="1">ON</option><option value="0">OFF</option></select></label>
+  <label>画面表示（OFFで少し軽くなる） <select id="selDraw"><option value="1">ON（床マスク）</option><option value="p">確率マップ（診断用）</option><option value="0">OFF</option></select></label>
   <label>試行メモ（CSVのファイル名に入る） <input id="inTag" type="text" placeholder="例: s01_run1"></label>
   <div class="row"><button id="btnTest">振動テスト（L→R→S→C）</button></div>
   <div class="row"><button id="btnRestore">前回のバックアップを保存</button></div>

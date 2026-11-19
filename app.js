@@ -219,16 +219,19 @@ async function processFrame(md) {
     frameIdx++;
     if (frameIdx % 150 === 0) backup();
   }
-  if (S.draw === '1') drawOverlay(img, r);
-  showStats(r, tDone - t0, t2 - t1, ageMs);
+  if (S.draw !== '0') drawOverlay(img, r, prob);
+  showStats(r, tDone - t0, t2 - t1, ageMs, probStats(prob));
 }
 
 // ---------------- 表示 ----------------
-function drawOverlay(img, r) {
-  const W = canvas.width, H = canvas.height, m = r.mask, vis = visData.data;
+function drawOverlay(img, r, prob) {
+  const W = canvas.width, H = canvas.height, m = r.mask, vis = visData.data, probMode = S.draw === 'p';
   for (let i = 0, p = 0; i < W * H; i++, p += 4) {
     let R = img[p], G = img[p + 1], B = img[p + 2];
-    if (m[i]) {
+    if (probMode) {                       // 確率マップ：赤いほど床らしい、青いほど床らしくない
+      const q = Math.min(1, Math.max(0, prob[i]));
+      R = (R * 0.35 + 165 * q) | 0; G = (G * 0.35) | 0; B = (B * 0.35 + 165 * (1 - q)) | 0;
+    } else if (m[i]) {
       const x = i % W;
       const edge = x === 0 || x === W - 1 || i < W || i >= W * (H - 1) || !m[i - 1] || !m[i + 1] || !m[i - W] || !m[i + W];
       if (edge) { R = 255; G = 255; B = 0; } else { R = (R + 60) >> 1; G = (G + 200) >> 1; B = (B + 60) >> 1; }
@@ -254,7 +257,12 @@ function drawOverlay(img, r) {
 }
 
 const CMD_VIEW = { L: ['←', '#4aa3ff'], R: ['→', '#ffb347'], C: ['↑', '#3cb371'], S: ['■', '#e04848'] };
-function showStats(r, latency, infer, ageMs) {
+function probStats(p) {
+  let mx = -Infinity, mn = Infinity, sum = 0, over = 0;
+  for (let i = 0; i < p.length; i++) { const v = p[i]; if (v > mx) mx = v; if (v < mn) mn = v; sum += v; if (v > 0.5) over++; }
+  return { min: mn, max: mx, mean: sum / p.length, over: over / p.length, nan: Number.isNaN(sum) };
+}
+function showStats(r, latency, infer, ageMs, ps) {
   const [sym, col] = CMD_VIEW[r.cmd] || ['?', '#fff'];
   $('cmdBig').textContent = sym; $('cmdBig').style.color = col;
   const fps = fpsT.length > 1 ? (fpsT.length - 1) / ((fpsT[fpsT.length - 1] - fpsT[0]) / 1000) : 0;
@@ -262,6 +270,7 @@ function showStats(r, latency, infer, ageMs) {
   $('stats').textContent =
     `fps ${fps.toFixed(1)}   遅延 ${latency.toFixed(0)}ms (推論 ${infer.toFixed(0)})   映像→指示 ${ageMs === null ? '―' : ageMs.toFixed(0) + 'ms'}\n` +
     `offset ${r.offset === null ? 'None' : (r.offset >= 0 ? '+' : '') + r.offset.toFixed(2)}  angle ${r.angleDeg === null ? '―' : r.angleDeg.toFixed(1)}°  床 ${(r.floorRatio * 100).toFixed(0)}%\n` +
+    `床確率 max ${ps.nan ? 'NaN' : ps.max.toFixed(2)} 平均 ${ps.mean.toFixed(2)} >0.5 ${(ps.over * 100).toFixed(0)}%\n` +
     `指示 ${r.cmd}${recording ? '' : '（プレビュー・未送信）'}   BLE往復 ${rtt}   衝突 ${collisions}`;
 }
 function setPill(id, text, cls) { const el = $(id); el.textContent = text; el.className = 'pill ' + (cls || ''); }
@@ -387,7 +396,7 @@ function stamp() {
 function csvText() { return COLS.join(',') + '\n' + rows.map((r) => r.join(',')).join('\n') + '\n'; }
 function download(name, text, type) {
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.href = URL.createObjectURL(text instanceof Blob ? text : new Blob([text], { type }));
   a.download = name; document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
@@ -400,6 +409,64 @@ function save() {
   log('保存:', base);
 }
 function backup() { store.set('backup', { name: `ashi_backup_${stamp()}.csv`, csv: csvText() }); }
+
+// ---------------- 診断：同じ入力を WebGPU と WASM(CPU) で計算して比べる ----------------
+let wasmSess = null, wasmFile = '';
+async function diagnose() {
+  if (!sess || !video.videoWidth) { alert('カメラとモデルの準備ができてから押してください'); return; }
+  if (recording) { alert('停止してから押してください'); return; }
+  preparing = true;
+  const out = [];
+  try {
+    while (busy) await sleep(5);
+    $('summary').style.display = 'block'; $('summary').textContent = '診断中…（WASMでの計算に数秒かかります）';
+    const W = inCanvas.width, H = inCanvas.height, n = W * H;
+    const rot = drawInput();
+    const img = ictx.getImageData(0, 0, W, H).data;
+    const x = new Float32Array(3 * n);
+    for (let i = 0, p = 0; i < n; i++, p += 4) { x[i] = img[p] / 255; x[n + i] = img[p + 1] / 255; x[2 * n + i] = img[p + 2] / 255; }
+    const ch = [0, 1, 2].map((c) => { let s = 0; for (let i = 0; i < n; i++) s += x[c * n + i]; return s / n; });
+    const fmt = (st) => `max ${st.max.toFixed(3)} / 平均 ${st.mean.toFixed(3)} / min ${st.min.toFixed(3)} / >0.5 ${(st.over * 100).toFixed(1)}%${st.nan ? ' / NaNあり' : ''}`;
+    out.push('==== 診断 ====', `モデル ${modelInfo.label} / 実行先 ${epUsed} / ORT ${ORT_VERSION} / 回転 ${rot}`,
+      `カメラ ${video.videoWidth}x${video.videoHeight} → 入力 ${W}x${H}`,
+      `入力の平均 R ${ch[0].toFixed(3)} G ${ch[1].toFixed(3)} B ${ch[2].toFixed(3)}（0〜1。ほぼ0なら映像が真っ黒）`);
+    let t0 = performance.now();
+    const a = Float32Array.from((await sess.run({ [inName]: new window.ort.Tensor('float32', new Float32Array(x), [1, 3, H, W]) }))[outName].data);
+    const sa = probStats(a);
+    out.push(`${epUsed}: ${fmt(sa)}  (${(performance.now() - t0).toFixed(0)}ms)`);
+    let sb = null, diff = 0, agree = 1;
+    if (epUsed !== 'wasm') {
+      if (!wasmSess || wasmFile !== modelInfo.file) {
+        wasmSess = await window.ort.InferenceSession.create('models/' + modelInfo.file, { executionProviders: ['wasm'] });
+        wasmFile = modelInfo.file;
+      }
+      t0 = performance.now();
+      const b = (await wasmSess.run({ [inName]: new window.ort.Tensor('float32', new Float32Array(x), [1, 3, H, W]) }))[outName].data;
+      sb = probStats(b);
+      let same = 0;
+      for (let i = 0; i < n; i++) { const d = Math.abs(a[i] - b[i]); if (!(d <= diff)) diff = d; if ((a[i] > 0.5) === (b[i] > 0.5)) same++; }
+      agree = same / n;
+      out.push(`wasm  : ${fmt(sb)}  (${(performance.now() - t0).toFixed(0)}ms)`,
+        `差: 最大 ${Number.isFinite(diff) ? diff.toFixed(4) : 'NaN'} / 床判定(>0.5)の一致率 ${(agree * 100).toFixed(2)}%`);
+    }
+    out.push('---- 判定 ----');
+    if (Math.max(...ch) < 0.02) out.push('入力がほぼ真っ黒です。カメラ映像が取れていません。');
+    else if (sb && (!(diff < 0.05) || agree < 0.99)) {
+      out.push('WebGPU の計算結果が CPU(WASM) と違います（GPU側の計算ミス）。',
+        sb.over > 0.01 ? '→ WASM では床が出ています。設定の「推論の実行先」を WASM にすると正しく動きます（遅くなります）。' : '→ WASM でも床が少ないので、モデル側の問題も重なっています。');
+    } else if (sa.over < 0.01) out.push('GPUとCPUの結果は一致しています。モデル自体がこの映像で床を見つけていません。保存した画像をPCの tools/check_image.py で調べてください。');
+    else out.push('床確率は出ています。マスク処理か表示の問題なので、この結果を送ってください。');
+    $('summary').textContent = out.join('\n');
+    log('診断完了');
+    inCanvas.toBlob((blob) => { if (blob) download(`ashi_diag_${stamp()}.png`, blob); }, 'image/png');
+    download(`ashi_diag_${stamp()}.txt`, out.join('\n') + '\n', 'text/plain');
+  } catch (e) {
+    out.push('診断エラー: ' + e.message);
+    $('summary').textContent = out.join('\n');
+    log('診断エラー:', e.message);
+  } finally { preparing = false; }
+}
+$('btnDiag').onclick = diagnose;
 
 // ---------------- 処理の停止を検知（カメラ途絶・推論の固まり） ----------------
 setInterval(() => {
