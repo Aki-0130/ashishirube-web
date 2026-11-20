@@ -59,11 +59,14 @@
 </div>
 <div id="summary"></div>
 <div class="row"><button id="btnSave">CSVを保存</button><button id="btnDiag">診断</button></div>
+<div class="row"><button id="btnGpuTest">WebGPU 組み合わせテスト（1〜2分）</button></div>
 
 <details>
   <summary>設定</summary>
   <label>モデル <select id="selModel"></select></label>
   <label>推論の実行先 <select id="selEp"><option value="webgpu">WebGPU（推奨）</option><option value="wasm">WASM（CPU・遅い）</option></select></label>
+  <label>WebGPU 最適化レベル <select id="selOpt"><option>all</option><option>extended</option><option>basic</option><option>disabled</option></select></label>
+  <label>WebGPU データの並び <select id="selLayout"><option>NHWC</option><option>NCHW</option></select></label>
   <label>カメラ <select id="selCam"><option value="">背面（既定）</option></select></label>
   <label>回転 <select id="selRot"><option>auto</option><option>0</option><option>90</option><option>180</option><option>270</option></select></label>
   <label>床ロスト時の指示 <select id="selLost"><option value="S">S（両側振動＝止まれ）</option><option value="C">C（旧仕様）</option></select></label>
@@ -81,6 +84,6 @@
 
 <!-- display:none だとフレーム通知が止まる端末があるので、見えない大きさで表示しておく -->
 <video id="video" playsinline muted style="position:fixed;left:0;bottom:0;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-<script type="module" src="app.js"></script>
+<script type="module" src="app.js?v=3"></script>
 </body>
 </html>

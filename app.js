@@ -1,5 +1,7 @@
 // あししるべ スマホ単体版：カメラ → 床推定(ONNX Runtime Web) → 指示 → Web Bluetooth → ESP32
-import { Guide, DEFAULTS } from './guide.js';
+import { Guide, DEFAULTS } from './guide.js?v=3';
+
+const APP_VERSION = 3;  // 更新のたびに index.html の app.js?v= と一緒に上げる
 
 const qs = new URLSearchParams(location.search);
 const ORT_VERSION = qs.get('ort') || '1.30.0';
@@ -34,7 +36,9 @@ const S = {
   lostCmd: store.get('lostCmd', DEFAULTS.lostCmd), holdTime: store.get('holdTime', DEFAULTS.holdTime),
   smooth: store.get('smooth', DEFAULTS.smooth), minFloor: store.get('minFloor', DEFAULTS.minFloor),
   lostFrames: store.get('lostFrames', DEFAULTS.lostFrames), draw: store.get('draw', '1'),
+  opt: store.get('opt', 'all'), layout: store.get('layout', 'NHWC'),  // WebGPU の最適化レベルとデータの並び
 };
+const gpuOpts = (opt, layout) => ({ executionProviders: [{ name: 'webgpu', preferredLayout: layout }], graphOptimizationLevel: opt });
 function guideParams() {
   return { thresh: S.thresh, lostCmd: S.lostCmd, holdTime: +S.holdTime, smooth: +S.smooth,
            minFloor: +S.minFloor, lostFrames: Math.max(1, Math.round(+S.lostFrames)) };
@@ -104,15 +108,14 @@ async function prepareSession() {
 async function createSession() {
   setPill('pEp', '推論 準備中…', 'warn');
   const url = 'models/' + modelInfo.file;
-  const opts = (ep) => ({ executionProviders: [ep], graphOptimizationLevel: 'all' });
   sess = null;
   if (S.ep === 'webgpu') {
     if (!navigator.gpu) log('この端末/ブラウザでは WebGPU が使えません → WASM で動かします');
     try {
-      if (navigator.gpu) { sess = await window.ort.InferenceSession.create(url, opts('webgpu')); epUsed = 'webgpu'; }
+      if (navigator.gpu) { sess = await window.ort.InferenceSession.create(url, gpuOpts(S.opt, S.layout)); epUsed = 'webgpu'; }
     } catch (e) { log('WebGPU での準備に失敗 → WASM に切替:', e.message); }
   }
-  if (!sess) { sess = await window.ort.InferenceSession.create(url, opts('wasm')); epUsed = 'wasm'; }
+  if (!sess) { sess = await window.ort.InferenceSession.create(url, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }); epUsed = 'wasm'; }
   inName = sess.inputNames[0]; outName = sess.outputNames[0];
   const { height: H, width: W } = modelInfo;
   inCanvas.width = canvas.width = W; inCanvas.height = canvas.height = H;
@@ -125,7 +128,7 @@ async function createSession() {
     t.push(performance.now() - t0);
   }
   log(`モデル準備完了 ${modelInfo.label} / ${epUsed} / ウォームアップ最終 ${t[t.length - 1].toFixed(0)}ms`);
-  setPill('pEp', `推論 ${epUsed} ${modelInfo.label}`, epUsed === 'webgpu' ? 'ok' : 'warn');
+  setPill('pEp', `推論 ${epUsed}${epUsed === 'webgpu' ? `(${S.opt}/${S.layout})` : ''} ${modelInfo.label}`, epUsed === 'webgpu' ? 'ok' : 'warn');
   guide = new Guide(guideParams());
 }
 
@@ -468,6 +471,73 @@ async function diagnose() {
 }
 $('btnDiag').onclick = diagnose;
 
+// ---------------- WebGPU の設定の組み合わせを総当たりして、WASM と一致するものを探す ----------------
+function captureInput() {
+  const W = inCanvas.width, H = inCanvas.height, n = W * H;
+  drawInput();
+  const img = ictx.getImageData(0, 0, W, H).data;
+  const x = new Float32Array(3 * n);
+  for (let i = 0, p = 0; i < n; i++, p += 4) { x[i] = img[p] / 255; x[n + i] = img[p + 1] / 255; x[2 * n + i] = img[p + 2] / 255; }
+  return { x, W, H, n };
+}
+async function gpuMatrix() {
+  if (!sess || !video.videoWidth) { alert('カメラとモデルの準備ができてから押してください'); return; }
+  if (recording) { alert('停止してから押してください'); return; }
+  if (!navigator.gpu) { alert('この端末では WebGPU が使えません'); return; }
+  preparing = true;
+  const out = ['==== WebGPU 組み合わせテスト ====', `モデル ${modelInfo.label} / ORT ${ORT_VERSION} / app v${APP_VERSION}`];
+  const show = (extra = '') => { $('summary').style.display = 'block'; $('summary').textContent = out.join('\n') + extra; };
+  let best = null;
+  try {
+    while (busy) await sleep(5);
+    const { x, W, H, n } = captureInput();
+    const url = 'models/' + modelInfo.file;
+    const feed = () => ({ [inName]: new window.ort.Tensor('float32', new Float32Array(x), [1, 3, H, W]) });
+    show('\nWASM で正解を計算中…');
+    if (!wasmSess || wasmFile !== modelInfo.file) {
+      wasmSess = await window.ort.InferenceSession.create(url, { executionProviders: ['wasm'] });
+      wasmFile = modelInfo.file;
+    }
+    const ref = Float32Array.from((await wasmSess.run(feed()))[outName].data);
+    const sr = probStats(ref);
+    out.push(`正解(wasm): 床確率>0.5 ${(sr.over * 100).toFixed(1)}%`, '最適化 / 並び : 一致率 / 最大差 / 推論時間');
+    // 今動いているセッションは一度解放して、GPUのメモリを空けておく
+    try { await sess.release(); } catch { /* 無視 */ }
+    sess = null;
+    for (const opt of ['all', 'extended', 'basic', 'disabled']) {
+      for (const layout of ['NHWC', 'NCHW']) {
+        show(`\n${opt} / ${layout} を試しています…`);
+        let s = null;
+        try {
+          s = await window.ort.InferenceSession.create(url, gpuOpts(opt, layout));
+          await s.run(feed());                                 // ウォームアップ
+          const ts = []; let a = null;
+          for (let k = 0; k < 3; k++) { const t0 = performance.now(); a = (await s.run(feed()))[outName].data; ts.push(performance.now() - t0); }
+          let diff = 0, same = 0;
+          for (let i = 0; i < n; i++) { const d = Math.abs(a[i] - ref[i]); if (!(d <= diff)) diff = d; if ((a[i] > 0.5) === (ref[i] > 0.5)) same++; }
+          const agree = same / n, t = median(ts), ok = agree >= 0.99 && diff < 0.05;
+          out.push(`${opt.padEnd(8)} / ${layout} : ${(agree * 100).toFixed(2)}% / ${Number.isFinite(diff) ? diff.toFixed(3) : 'NaN'} / ${t.toFixed(0)}ms ${ok ? '○' : '×'}`);
+          if (ok && (!best || t < best.t)) best = { opt, layout, t };
+        } catch (e) {
+          out.push(`${opt.padEnd(8)} / ${layout} : エラー ${e.message.slice(0, 80)}`);
+        } finally { try { await s?.release(); } catch { /* 無視 */ } }
+      }
+    }
+    out.push('---- 結果 ----', best
+      ? `○ の中で最速: ${best.opt} / ${best.layout}（${best.t.toFixed(0)}ms）`
+      : 'どの組み合わせでも WASM と一致しませんでした。URL の末尾を ?ort=1.24.2 などに変えて、このテストをもう一度試してください。');
+    show();
+    download(`ashi_gputest_${stamp()}.txt`, out.join('\n') + '\n', 'text/plain');
+  } catch (e) {
+    out.push('テストエラー: ' + e.message); show();
+  } finally {
+    preparing = false;
+  }
+  if (best && confirm(`${best.opt} / ${best.layout} を使うように設定しますか？`)) { S.opt = best.opt; S.layout = best.layout; store.set('opt', S.opt); store.set('layout', S.layout); $('selOpt').value = S.opt; $('selLayout').value = S.layout; }
+  await reprepare();
+}
+$('btnGpuTest').onclick = gpuMatrix;
+
 // ---------------- 処理の停止を検知（カメラ途絶・推論の固まり） ----------------
 setInterval(() => {
   if (!recording) return;
@@ -522,6 +592,8 @@ function bindSetting(id, key, after) {
 const reprepare = async () => { if (recording) { alert('記録中は変更できません'); return; } try { await prepareSession(); } catch (e) { log('準備エラー:', e.message); } };
 bindSetting('selModel', 'model', reprepare);
 bindSetting('selEp', 'ep', reprepare);
+bindSetting('selOpt', 'opt', reprepare);
+bindSetting('selLayout', 'layout', reprepare);
 bindSetting('selCam', 'cam', async () => { try { await openCamera(); } catch (e) { log('カメラエラー:', e.message); } });
 bindSetting('selRot', 'rot', () => { guide.probAvg = null; });
 bindSetting('selLost', 'lostCmd');
@@ -534,6 +606,7 @@ setThresh(S.thresh);
 
 // ---------------- 起動 ----------------
 (async () => {
+  log(`あししるべ app v${APP_VERSION} / ORT ${ORT_VERSION}`);
   if (!window.isSecureContext) log('注意: https で開いていないため、カメラとBluetoothが使えません');
   await loadModelList();
   try { await openCamera(); } catch (e) { log('カメラを開けません:', e.message); }
