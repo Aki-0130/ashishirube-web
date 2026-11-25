@@ -65,6 +65,7 @@
   <summary>設定</summary>
   <label>モデル <select id="selModel"></select></label>
   <label>推論の実行先 <select id="selEp"><option value="webgpu">WebGPU（推奨）</option><option value="wasm">WASM（CPU・遅い）</option></select></label>
+  <label>WASM のスレッド数（変えると再読み込み） <select id="selThreads"><option>1</option><option>2</option><option>4</option><option>6</option><option>8</option></select></label>
   <label>WebGPU 最適化レベル <select id="selOpt"><option>all</option><option>extended</option><option>basic</option><option>disabled</option></select></label>
   <label>WebGPU データの並び <select id="selLayout"><option>NHWC</option><option>NCHW</option></select></label>
   <label>カメラ <select id="selCam"><option value="">背面（既定）</option></select></label>
@@ -84,6 +85,21 @@
 
 <!-- display:none だとフレーム通知が止まる端末があるので、見えない大きさで表示しておく -->
 <video id="video" playsinline muted style="position:fixed;left:0;bottom:0;width:2px;height:2px;opacity:0.01;pointer-events:none"></video>
-<script type="module" src="app.js?v=4"></script>
+<script>
+// WASM を複数スレッドで動かすため、Service Worker でページを crossOriginIsolated にする（coi-sw.js）
+(function () {
+  var off = new URLSearchParams(location.search).get('coi') === '0';
+  if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
+  if (off) { navigator.serviceWorker.getRegistrations().then(function (rs) { rs.forEach(function (r) { r.unregister(); }); }); return; }
+  if (window.crossOriginIsolated) { sessionStorage.removeItem('coiReloaded'); return; }
+  navigator.serviceWorker.register('coi-sw.js').then(function () {
+    if (sessionStorage.getItem('coiReloaded')) return;   // 再読み込みは1回だけ（無限ループ防止）
+    var reload = function () { sessionStorage.setItem('coiReloaded', '1'); location.reload(); };
+    if (navigator.serviceWorker.controller) reload();
+    else navigator.serviceWorker.addEventListener('controllerchange', reload);
+  });
+})();
+</script>
+<script type="module" src="app.js?v=5"></script>
 </body>
 </html>

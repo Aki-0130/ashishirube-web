@@ -1,7 +1,7 @@
 // あししるべ スマホ単体版：カメラ → 床推定(ONNX Runtime Web) → 指示 → Web Bluetooth → ESP32
-import { Guide, DEFAULTS } from './guide.js?v=4';
+import { Guide, DEFAULTS } from './guide.js?v=5';
 
-const APP_VERSION = 4;  // 更新のたびに index.html の app.js?v= と一緒に上げる
+const APP_VERSION = 5;  // 更新のたびに index.html の app.js?v= と一緒に上げる
 
 const qs = new URLSearchParams(location.search);
 const ORT_VERSION = qs.get('ort') || '1.30.0';
@@ -36,7 +36,8 @@ const S = {
   lostCmd: store.get('lostCmd', DEFAULTS.lostCmd), holdTime: store.get('holdTime', DEFAULTS.holdTime),
   smooth: store.get('smooth', DEFAULTS.smooth), minFloor: store.get('minFloor', DEFAULTS.minFloor),
   lostFrames: store.get('lostFrames', DEFAULTS.lostFrames), draw: store.get('draw', '1'),
-  opt: store.get('opt', 'all'), layout: store.get('layout', 'NHWC'),  // WebGPU の最適化レベルとデータの並び
+  opt: store.get('opt', 'all'), layout: store.get('layout', 'NHWC'),
+  threads: store.get('threads', '4'),  // WebGPU の最適化レベルとデータの並び
 };
 const gpuOpts = (opt, layout) => ({ executionProviders: [{ name: 'webgpu', preferredLayout: layout }], graphOptimizationLevel: opt });
 function guideParams() {
@@ -69,15 +70,23 @@ function loadScript(src) {
     document.head.appendChild(s);
   });
 }
+let ortReady = false;
 async function loadOrt() {
-  if (window.ort) return;
-  for (const f of ['ort.webgpu.min.js', 'ort.all.min.js', 'ort.min.js']) {
+  if (ortReady) return;
+  for (const f of window.ort ? [] : ['ort.webgpu.min.js', 'ort.all.min.js', 'ort.min.js']) {
     try { await loadScript(ORT_BASE + f); } catch (e) { log(e.message); continue; }
     if (window.ort) { log(`ONNX Runtime Web ${ORT_VERSION} (${f})`); break; }
   }
   if (!window.ort) throw new Error('ONNX Runtime Web を読み込めません（通信を確認してください）');
   window.ort.env.wasm.wasmPaths = ORT_BASE;
+  wasmThreads = window.crossOriginIsolated ? Math.max(1, +S.threads) : 1;
+  window.ort.env.wasm.numThreads = wasmThreads;
+  log(window.crossOriginIsolated
+    ? `WASM: ${wasmThreads}スレッド（並列化できる状態）`
+    : 'WASM: 1スレッド（このページは並列化できない状態。再読み込みすると直ることがあります）');
+  ortReady = true;
 }
+let wasmThreads = 1;
 
 async function loadModelList() {
   try {
@@ -128,7 +137,7 @@ async function createSession() {
     t.push(performance.now() - t0);
   }
   log(`モデル準備完了 ${modelInfo.label} / ${epUsed} / ウォームアップ最終 ${t[t.length - 1].toFixed(0)}ms`);
-  setPill('pEp', `推論 ${epUsed}${epUsed === 'webgpu' ? `(${S.opt}/${S.layout})` : ''} ${modelInfo.label}`, epUsed === 'webgpu' ? 'ok' : 'warn');
+  setPill('pEp', `推論 ${epUsed}${epUsed === 'webgpu' ? `(${S.opt}/${S.layout})` : `×${wasmThreads}`} ${modelInfo.label}`, epUsed === 'webgpu' ? 'ok' : 'warn');
   guide = new Guide(guideParams());
 }
 
@@ -348,6 +357,7 @@ async function start() {
   tStart = performance.now(); lastDoneAt = tStart;
   startMeta = {
     started: new Date().toISOString(), model: modelInfo.label, ep: epUsed, ort: ORT_VERSION, camera: camLabel,
+    wasmThreads, webgpuOpt: `${S.opt}/${S.layout}`, app: APP_VERSION,
     rotate: S.rot, params: guideParams(), ua: navigator.userAgent, tag: $('inTag').value,
   };
   recording = true;
@@ -430,7 +440,8 @@ async function diagnose() {
     for (let i = 0, p = 0; i < n; i++, p += 4) { x[i] = img[p] / 255; x[n + i] = img[p + 1] / 255; x[2 * n + i] = img[p + 2] / 255; }
     const ch = [0, 1, 2].map((c) => { let s = 0; for (let i = 0; i < n; i++) s += x[c * n + i]; return s / n; });
     const fmt = (st) => `max ${st.max.toFixed(3)} / 平均 ${st.mean.toFixed(3)} / min ${st.min.toFixed(3)} / >0.5 ${(st.over * 100).toFixed(1)}%${st.nan ? ' / NaNあり' : ''}`;
-    out.push('==== 診断 ====', `モデル ${modelInfo.label} / 実行先 ${epUsed} / ORT ${ORT_VERSION} / 回転 ${rot}`,
+    out.push('==== 診断 ====', `モデル ${modelInfo.label} / 実行先 ${epUsed} / ORT ${ORT_VERSION} / 回転 ${rot} / app v${APP_VERSION}`,
+      `WASM ${wasmThreads}スレッド / crossOriginIsolated ${window.crossOriginIsolated}`,
       `カメラ ${video.videoWidth}x${video.videoHeight} → 入力 ${W}x${H}`,
       `入力の平均 R ${ch[0].toFixed(3)} G ${ch[1].toFixed(3)} B ${ch[2].toFixed(3)}（0〜1。ほぼ0なら映像が真っ黒）`);
     let t0 = performance.now();
@@ -605,6 +616,7 @@ const reprepare = async () => { if (recording) { alert('記録中は変更でき
 bindSetting('selModel', 'model', reprepare);
 bindSetting('selEp', 'ep', reprepare);
 bindSetting('selOpt', 'opt', reprepare);
+bindSetting('selThreads', 'threads', () => location.reload());  // スレッド数は最初の読み込み時にしか変えられない
 bindSetting('selLayout', 'layout', reprepare);
 bindSetting('selCam', 'cam', async () => { try { await openCamera(); } catch (e) { log('カメラエラー:', e.message); } });
 bindSetting('selRot', 'rot', () => { guide.probAvg = null; });
