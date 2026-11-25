@@ -1,7 +1,7 @@
 // あししるべ スマホ単体版：カメラ → 床推定(ONNX Runtime Web) → 指示 → Web Bluetooth → ESP32
-import { Guide, DEFAULTS } from './guide.js?v=3';
+import { Guide, DEFAULTS } from './guide.js?v=4';
 
-const APP_VERSION = 3;  // 更新のたびに index.html の app.js?v= と一緒に上げる
+const APP_VERSION = 4;  // 更新のたびに index.html の app.js?v= と一緒に上げる
 
 const qs = new URLSearchParams(location.search);
 const ORT_VERSION = qs.get('ort') || '1.30.0';
@@ -116,7 +116,7 @@ async function createSession() {
     } catch (e) { log('WebGPU での準備に失敗 → WASM に切替:', e.message); }
   }
   if (!sess) { sess = await window.ort.InferenceSession.create(url, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }); epUsed = 'wasm'; }
-  inName = sess.inputNames[0]; outName = sess.outputNames[0];
+  inName = sess.inputNames[0]; outName = sess.outputNames.includes('floor') ? 'floor' : sess.outputNames[0];
   const { height: H, width: W } = modelInfo;
   inCanvas.width = canvas.width = W; inCanvas.height = canvas.height = H;
   visData = octx.createImageData(W, H);
@@ -434,7 +434,8 @@ async function diagnose() {
       `カメラ ${video.videoWidth}x${video.videoHeight} → 入力 ${W}x${H}`,
       `入力の平均 R ${ch[0].toFixed(3)} G ${ch[1].toFixed(3)} B ${ch[2].toFixed(3)}（0〜1。ほぼ0なら映像が真っ黒）`);
     let t0 = performance.now();
-    const a = Float32Array.from((await sess.run({ [inName]: new window.ort.Tensor('float32', new Float32Array(x), [1, 3, H, W]) }))[outName].data);
+    const resA = await sess.run({ [inName]: new window.ort.Tensor('float32', new Float32Array(x), [1, 3, H, W]) });
+    const a = Float32Array.from(resA[outName].data);
     const sa = probStats(a);
     out.push(`${epUsed}: ${fmt(sa)}  (${(performance.now() - t0).toFixed(0)}ms)`);
     let sb = null, diff = 0, agree = 1;
@@ -444,13 +445,24 @@ async function diagnose() {
         wasmFile = modelInfo.file;
       }
       t0 = performance.now();
-      const b = (await wasmSess.run({ [inName]: new window.ort.Tensor('float32', new Float32Array(x), [1, 3, H, W]) }))[outName].data;
+      const resB = await wasmSess.run({ [inName]: new window.ort.Tensor('float32', new Float32Array(x), [1, 3, H, W]) });
+      const b = resB[outName].data;
       sb = probStats(b);
       let same = 0;
       for (let i = 0; i < n; i++) { const d = Math.abs(a[i] - b[i]); if (!(d <= diff)) diff = d; if ((a[i] > 0.5) === (b[i] > 0.5)) same++; }
       agree = same / n;
       out.push(`wasm  : ${fmt(sb)}  (${(performance.now() - t0).toFixed(0)}ms)`,
         `差: 最大 ${Number.isFinite(diff) ? diff.toFixed(4) : 'NaN'} / 床判定(>0.5)の一致率 ${(agree * 100).toFixed(2)}%`);
+      if (sess.outputNames.length > 1) {   // 診断用モデル：途中の値ごとに GPU と CPU を比べる
+        out.push('---- 途中の値ごとの比較（相対誤差 = 最大差 / CPU側の最大絶対値。0.01未満なら一致）----');
+        for (const name of sess.outputNames) {
+          const ga = resA[name].data, cb = resB[name].data;
+          let md = 0, mref = 0;
+          for (let i = 0; i < cb.length; i++) { const d = Math.abs(ga[i] - cb[i]); if (!(d <= md)) md = d; const r = Math.abs(cb[i]); if (r > mref) mref = r; }
+          const rel = md / Math.max(mref, 1e-6);
+          out.push(`  ${name.padEnd(9)} [${resB[name].dims.join('x')}] 相対誤差 ${Number.isFinite(rel) ? rel.toFixed(4) : 'NaN'} ${rel < 0.01 ? '○' : '×'}`);
+        }
+      }
     }
     out.push('---- 判定 ----');
     if (Math.max(...ch) < 0.02) out.push('入力がほぼ真っ黒です。カメラ映像が取れていません。');
